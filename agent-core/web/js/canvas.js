@@ -1108,6 +1108,38 @@ async function _clearCanvas() {
 
 // ── Card rendering ────────────────────────────────────────────────────────────
 
+function _bindActionFields(el, schema) {
+  // x-action-params: 根据选中的 action 动态显隐参数字段
+  const actionParams = schema?.['x-action-params'];
+  if (actionParams) {
+    const actionSelect = el.querySelector('.canvas-field-input[data-key="action"]');
+    if (actionSelect) {
+      const _applyActionParams = () => {
+        const selected = actionSelect.value;
+        const paramKeys = actionParams[selected]?.params || [];
+        el.querySelectorAll('.canvas-field').forEach(field => {
+          const key = field.querySelector('.canvas-field-input')?.dataset?.key;
+          if (!key || key === 'action') return;
+          field.style.display = paramKeys.includes(key) ? '' : 'none';
+        });
+        // Showing/hiding fields changes the card's height, which moves every
+        // port on it. The card ResizeObserver (_syncGeometryObservers) now
+        // covers this, but ask explicitly too so the behaviour does not
+        // depend on ResizeObserver being available.
+        _scheduleRedraw();
+      };
+      actionSelect.addEventListener('change', async () => {
+        if (!(await _ensureEdit())) {
+          _applyActionParams();  // revert visual to match current state
+          return;
+        }
+        _applyActionParams();
+      });
+      _applyActionParams();  // 初始应用
+    }
+  }
+}
+
 function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTopicIn, topicOut: savedTopicOut, topicOutFrom }) {
   const el = document.createElement('div');
   el.dataset.cardId = id;
@@ -1207,7 +1239,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (hasSensorActions) {
       sensorFieldsHtml = Object.entries(sensorProps).map(([key, def]) => {
         const isReq = sensorRequired.includes(key);
-        const label = key + (isReq ? ' *' : '');
+        const label = (def.title || key) + (isReq ? ' *' : '');
         let inputHtml;
         const rawVals = _actionVals(def);
         if (rawVals.length || def.enum || def.oneOf) {
@@ -1217,7 +1249,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           const allVals = rawVals.length ? rawVals : (def.enum || []);
           const enumVals = key === 'action' ? allVals.filter(v => !_SENSOR_SYS_ACTIONS.has(v)) : allVals;
           if (!enumVals.length) return '';
-          const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(titleMap[v] || v)}</option>`).join('');
+          const opts = enumVals.map(v => `<option value="${_esc(v)}"${v === def.default ? ' selected' : ''}>${_esc(titleMap[v] || v)}</option>`).join('');
           inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
         } else if (def.format === 'file') {
           const accept = def.accept || '*/*';
@@ -1298,6 +1330,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       e.stopPropagation();
       _openTopicDetailFor(el, mcpId, topicOut);
     });
+
+    _bindActionFields(el, schema);
 
     const sensorExecBtn = el.querySelector('.canvas-exec-btn');
     if (sensorExecBtn) {
@@ -1467,35 +1501,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       _removeCard(id);
     });
 
-    // x-action-params: 根据选中的 action 动态显隐参数字段
-    const actionParams = schema?.['x-action-params'];
-    if (actionParams) {
-      const actionSelect = el.querySelector('.canvas-field-input[data-key="action"]');
-      if (actionSelect) {
-        const _applyActionParams = () => {
-          const selected = actionSelect.value;
-          const paramKeys = actionParams[selected]?.params || [];
-          el.querySelectorAll('.canvas-field').forEach(field => {
-            const key = field.querySelector('.canvas-field-input')?.dataset?.key;
-            if (!key || key === 'action') return;
-            field.style.display = paramKeys.includes(key) ? '' : 'none';
-          });
-          // Showing/hiding fields changes the card's height, which moves every
-          // port on it. The card ResizeObserver (_syncGeometryObservers) now
-          // covers this, but ask explicitly too so the behaviour does not
-          // depend on ResizeObserver being available.
-          _scheduleRedraw();
-        };
-        actionSelect.addEventListener('change', async () => {
-          if (!(await _ensureEdit())) {
-            _applyActionParams();  // revert visual to match current state
-            return;
-          }
-          _applyActionParams();
-        });
-        _applyActionParams();  // 初始应用
-      }
-    }
+    _bindActionFields(el, schema);
 
     el.querySelector('.canvas-card-info-btn').addEventListener('click', (e) => {
       e.stopPropagation();
@@ -2942,6 +2948,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
 
   const args = {};
   el.querySelectorAll('.canvas-field-input').forEach(input => {
+    if (input.closest('.canvas-field')?.style.display === 'none') return;
     const key = input.dataset.key;
     const val = input.value.trim();
     if (val !== '') {
