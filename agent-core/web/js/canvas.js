@@ -1228,7 +1228,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     const sensorActionDef = sensorProps.action;
     // Support both enum (plain list) and oneOf [{const, title}] formats
     const _actionVals = def => def?.enum || (def?.oneOf?.map(o => o.const).filter(v => v != null)) || [];
-    const hasSensorActions = _actionVals(sensorActionDef).some(a => !_SENSOR_SYS_ACTIONS.has(a));
+    const sensorActions = _actionVals(sensorActionDef).filter(action => !_SENSOR_SYS_ACTIONS.has(action));
+    const hasSensorActions = sensorActions.length > 0;
+    const hasSensorStream = topicOut.length > 0;
+    const directAction = sensorActions.length === 1 && Object.keys(sensorProps).length === 1 ? sensorActions[0] : '';
+    const executeLabel = (directAction && sensorActionDef.oneOf?.find(o => o.const === directAction)?.title) || '执行';
 
     // Instance config button (for multiInstance sensors with instance-scope fields)
     const sensorInstanceCfgBtn = hasInstanceFields
@@ -1236,7 +1240,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       : '';
 
     let sensorFieldsHtml = '';
-    if (hasSensorActions) {
+    if (hasSensorActions && !directAction) {
       sensorFieldsHtml = Object.entries(sensorProps).map(([key, def]) => {
         const isReq = sensorRequired.includes(key);
         const label = (def.title || key) + (isReq ? ' *' : '');
@@ -1285,11 +1289,12 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           <button class="canvas-card-close" title="从画布移除">✕</button>
         </div>
         ${sensorFieldsHtml ? `<div class="canvas-card-body">${sensorFieldsHtml}</div>` : ''}
-        <div class="canvas-card-footer" style="padding:8px 10px">
-          ${hasSensorActions ? `<button class="canvas-exec-btn${_projectRunning ? '' : ' locked'}">▶ 执行</button>` : ''}
-          ${hasSensorActions ? '<hr class="canvas-footer-divider">' : ''}
-          <button class="canvas-view-btn">📡 查看数据流</button>
-        </div>
+        ${directAction ? `<input type="hidden" class="canvas-field-input" data-key="action" value="${_esc(directAction)}">` : ''}
+        ${hasSensorActions || hasSensorStream ? `<div class="canvas-card-footer" style="padding:8px 10px">
+          ${hasSensorActions ? `<button class="canvas-exec-btn${_projectRunning ? '' : ' locked'}">▶ ${_esc(executeLabel)}</button>` : ''}
+          ${hasSensorActions && hasSensorStream ? '<hr class="canvas-footer-divider">' : ''}
+          ${hasSensorStream ? '<button class="canvas-view-btn">📡 查看数据流</button>' : ''}
+        </div>` : ''}
       </div>
       <div class="canvas-port-col left">${inPortsHtml}</div>
       <div class="canvas-port-col right">${outPortsHtml}</div>
@@ -1326,7 +1331,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       });
     }
 
-    el.querySelector('.canvas-view-btn').addEventListener('click', (e) => {
+    el.querySelector('.canvas-view-btn')?.addEventListener('click', (e) => {
       e.stopPropagation();
       _openTopicDetailFor(el, mcpId, topicOut);
     });
@@ -2815,7 +2820,8 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
   const livePorts = [...el.querySelectorAll('.canvas-port.out')]
     .map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
   const liveMcp = _allMcps.find(m => m.id === mcpId);
-  const candidate = [...livePorts, ...(cachedTopicOut || []), ...(liveMcp?.topic_out || [])]
+  const singleToolTopics = (liveMcp?.tools || []).length <= 1 ? (liveMcp?.topic_out || []) : [];
+  const candidate = [...livePorts, ...(cachedTopicOut || []), ...singleToolTopics]
     .find(t => t && t.topic);
   if (!candidate) {
     _showToast('该卡片还没有解析出输出 topic —— 先点「开始控制」把它启动起来');
@@ -2943,6 +2949,7 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
 
 async function _executeCard(el, mcpId, toolName, instanceId) {
   const btn = el.querySelector('.canvas-exec-btn');
+  const buttonText = btn.textContent;
   btn.disabled = true;
   btn.textContent = '执行中…';
 
@@ -2999,7 +3006,9 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
         return;
       }
       const resultText = _formatCallResult(json.data);
-      _showResult(el, resultText, false);
+      const result = el.classList.contains('sensor') && !outPorts.length ? _parseMcpCallResult(json) : null;
+      const message = typeof result?.message === 'string' ? result.message.trim() : '';
+      _showResult(el, resultText, false, message);
       // The panel can afford a 144-entry list; one log line cannot.
       _logActivity('mcp_result', `${toolName} → ${_truncate(resultText, 400)}`);
     } else {
@@ -3012,7 +3021,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     _logActivity('mcp_error', `${toolName} error: ${err}`);
   } finally {
     btn.disabled = false;
-    btn.textContent = '▶ 执行';
+    btn.textContent = buttonText;
   }
 }
 
@@ -3060,7 +3069,7 @@ function _formatCallResult(data) {
   return payload === undefined ? '' : JSON.stringify(payload, null, 2);
 }
 
-function _showResult(el, text, isError) {
+function _showResult(el, text, isError, message = '') {
   const existing = el.querySelector('.canvas-result');
   if (existing) existing.remove();
   const wrapper = document.createElement('div');
@@ -3080,8 +3089,22 @@ function _showResult(el, text, isError) {
       _selectElementText(pre);
     }
   });
-  wrapper.appendChild(pre);
+  if (message) {
+    const readout = document.createElement('p');
+    readout.className = 'canvas-result-message';
+    readout.setAttribute('role', 'status');
+    readout.textContent = message;
+    const details = document.createElement('details');
+    details.className = 'canvas-result-details';
+    const summary = document.createElement('summary');
+    summary.textContent = '详细数据';
+    details.append(summary, pre);
+    wrapper.append(readout, details);
+  } else {
+    wrapper.appendChild(pre);
+  }
   el.appendChild(wrapper);
+  _scheduleRedraw();
 }
 
 function _selectElementText(node) {
