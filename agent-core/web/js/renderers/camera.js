@@ -97,14 +97,15 @@ const DEPTH_FAR_BASE = DEPTH_NEAR_SHARE * 255;
 // One depth frame into RGBA. `u16` is millimetres, 0 meaning "no reading" —
 // which is drawn transparent rather than as contact, because an unknown pixel
 // rendered as an obstacle at zero range is the most alarming possible lie.
-export function paintDepth(u16, rgba, count) {
+export function paintDepth(u16, rgba, count, range = null) {
+  const rangeScale = range ? 255 / (range[1] - range[0]) : 0;
   for (let i = 0; i < count; i++) {
     const d = u16[i];
     const idx = i * 4;
     if (d === 0) { rgba[idx + 3] = 0; continue; }
     const mm = d < DEPTH_MAX_MM ? d : DEPTH_MAX_MM;
-    const s = (mm <= DEPTH_NEAR_MM
-      ? mm * DEPTH_NEAR_SCALE
+    const s = (range ? Math.max(0, Math.min(255, (d - range[0]) * rangeScale))
+      : mm <= DEPTH_NEAR_MM ? mm * DEPTH_NEAR_SCALE
       : DEPTH_FAR_BASE + (mm - DEPTH_NEAR_MM) * DEPTH_FAR_SCALE) | 0;
     rgba[idx]     = DEPTH_LUT[s * 3];
     rgba[idx + 1] = DEPTH_LUT[s * 3 + 1];

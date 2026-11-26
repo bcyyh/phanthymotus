@@ -16,7 +16,9 @@ WebSocket endpoint (mounted on root app in start.py):
 """
 
 import asyncio
+from collections import defaultdict, deque
 import json
+import struct
 import time
 
 import fastapi
@@ -33,6 +35,7 @@ _topic_registry: dict[str, dict] = {}
 
 # per-topic fan-out queues: topic → list of asyncio.Queue (one per WS consumer)
 _topic_queues: dict[str, list] = {}
+_depth_preview_queues = defaultdict(list)
 
 # Active primary subscriptions (topic paths with live DDS sub)
 _active_primary_subs: set[str] = set()
@@ -43,6 +46,7 @@ _logged_topic_collisions: set[tuple] = set()
 
 # Last frame cache per topic (for initial snapshot push on new WS connect)
 _last_frame: dict[str, bytes] = {}
+_last_capture_time: dict[str, float] = {}
 
 
 # ── Status helpers ─────────────────────────────────────────────────────────────
@@ -62,18 +66,23 @@ def _topic_status(topic: str) -> str:
 def _push_factory(topic: str):
     """Create a push callback for a topic that fans out to all WS consumers."""
     _push_count = [0]
-    async def _push(data: bytes, msg_fmt: str):
+    async def _push(data: bytes, msg_fmt: str, capture_time: float = 0.0):
         # Cache latest frame for snapshot push on new connections
         _last_frame[topic] = data
+        _last_capture_time[topic] = capture_time
         queues = _topic_queues.get(topic, [])
         _push_count[0] += 1
         if topic == '/remote_control/mic' and _push_count[0] <= 5:
             print(f'[inspection] DEBUG push #{_push_count[0]} to {topic}: {len(data)}B, {len(queues)} consumers')
         for q in list(queues):
             try:
-                q.put_nowait(data)
+                q.put_nowait((data, capture_time))
             except asyncio.QueueFull:
                 pass  # drop frame for slow consumer
+        for q in _depth_preview_queues.get(topic, ()):
+            if q.full():
+                q.get_nowait()
+            q.put_nowait((topic, data, capture_time))
         # 处理 perf_span 类型消息（来自 perception TTS 等组件）
         if topic == '/perception/perf_spans':
             try:
@@ -120,7 +129,10 @@ def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
         return  # already subscribed
 
     _active_primary_subs.add(topic)  # mark immediately to prevent race
-    ros2_bridge.subscribe(key, topic, fmt, loop, _push_factory(topic))
+    if fmt in ('image/jpeg', 'image/depth-zlib'):
+        ros2_bridge.subscribe(key, topic, fmt, loop, _push_factory(topic), with_stamp=True)
+    else:
+        ros2_bridge.subscribe(key, topic, fmt, loop, _push_factory(topic))
     print(f'[inspection] started primary sub: {topic}')
 
 
@@ -268,8 +280,55 @@ async def topics_subscriptions():
 
 # ── WebSocket relay ────────────────────────────────────────────────────────────
 
+async def _depth_preview_ws(websocket, depth_topic, rgb_topic):
+    """Send matched RGB and depth in the same binary packet."""
+    queue = asyncio.Queue(maxsize=8)
+    for topic in (depth_topic, rgb_topic):
+        _depth_preview_queues[topic].append(queue)
+        _ensure_primary_sub(topic, _topic_registry[topic]['format'], asyncio.get_running_loop())
+
+    depths = deque(maxlen=8)
+    colors = deque(maxlen=4)
+    sent_color = sent_depth = last_pair = last_send = 0.0
+    try:
+        await websocket.send_text(json.dumps({'type': 'meta', 'topic': depth_topic,
+                                              'format': 'image/depth-zlib', 'preview_pair': 'rgb-depth-v1'}))
+        while True:
+            try:
+                topic, data, stamp = await asyncio.wait_for(queue.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                await websocket.send_text('{"type":"ping"}')
+                continue
+            if stamp > 0:
+                (depths if topic == depth_topic else colors).append((stamp, data))
+            now = time.monotonic()
+            if not depths or now - last_send < .18:
+                continue
+            for color_stamp, rgb in reversed(colors):
+                if color_stamp <= sent_color:
+                    continue
+                depth_stamp, depth = min(depths, key=lambda item: abs(item[0] - color_stamp))
+                if abs(depth_stamp - color_stamp) <= .065:
+                    await websocket.send_bytes(struct.pack('!I', len(rgb)) + rgb + depth)
+                    last_send = last_pair = now
+                    sent_color, sent_depth = color_stamp, depth_stamp
+                    break
+            else:
+                depth_stamp, depth = depths[-1]
+                if now - last_pair >= .5 and depth_stamp > sent_depth:
+                    await websocket.send_bytes(b'\0' * 4 + depth)
+                    sent_depth, last_send = depth_stamp, now
+    except (fastapi.WebSocketDisconnect, OSError):
+        pass
+    finally:
+        for topic in (depth_topic, rgb_topic):
+            _depth_preview_queues[topic].remove(queue)
+            if not _depth_preview_queues[topic]:
+                del _depth_preview_queues[topic]
+
+
 @ws_router.websocket('/ws/bus/{topic:path}')
-async def bus_ws(websocket: fastapi.WebSocket, topic: str):
+async def bus_ws(websocket: fastapi.WebSocket, topic: str, stamp: bool = False, rgb: str = ''):
     await websocket.accept()
 
     topic = '/' + topic  # restore leading /
@@ -284,6 +343,22 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
         return
 
     fmt = info['format']
+    if rgb:
+        if fmt != 'image/depth-zlib' or _topic_registry.get(rgb, {}).get('format') != 'image/jpeg':
+            await websocket.send_text('{"type":"error","message":"Invalid RGB and depth preview topics"}')
+            await websocket.close()
+            return
+        await _depth_preview_ws(websocket, topic, rgb)
+        return
+    stamped = stamp and fmt in ('image/jpeg', 'image/depth-zlib')
+
+    async def send_frame(data, capture_time):
+        if stamped:
+            await websocket.send_bytes(struct.pack('!d', capture_time) + data)
+        elif fmt not in ('sensor/pointcloud', 'sensor/mapping') and fmt.startswith(('data/', 'text/', 'sensor/')):
+            await websocket.send_text(data.decode('utf-8', errors='replace'))
+        else:
+            await websocket.send_bytes(data)
     loop = asyncio.get_event_loop()
 
     # Ensure DDS subscription is active (no-op if already running)
@@ -294,17 +369,13 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
         'ts':     time.time(),
         'topic':  topic,
         'format': fmt,
+        **({'capture_time_prefix': 'f64be-seconds'} if stamped else {}),
     }))
 
     # Push cached snapshot immediately (so page refresh shows current map)
     snapshot = _last_frame.get(topic)
     if snapshot:
-        if fmt in ('sensor/pointcloud', 'sensor/mapping'):
-            await websocket.send_bytes(snapshot)
-        elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
-            await websocket.send_text(snapshot.decode('utf-8', errors='replace'))
-        else:
-            await websocket.send_bytes(snapshot)
+        await send_frame(snapshot, _last_capture_time.get(topic, 0.0))
 
     q: asyncio.Queue = asyncio.Queue(maxsize=4096)
     _topic_queues.setdefault(topic, []).append(q)
@@ -312,15 +383,10 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
     try:
         while True:
             try:
-                data = await asyncio.wait_for(q.get(), timeout=5.0)
-                if data is None:
+                frame = await asyncio.wait_for(q.get(), timeout=5.0)
+                if frame is None:
                     break  # signal to stop
-                if fmt in ('sensor/pointcloud', 'sensor/mapping'):
-                    await websocket.send_bytes(data)
-                elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
-                    await websocket.send_text(data.decode('utf-8', errors='replace'))
-                else:
-                    await websocket.send_bytes(data)
+                await send_frame(*frame)
             except asyncio.TimeoutError:
                 try:
                     await websocket.send_text(json.dumps({'type': 'ping', 'ts': time.time()}))

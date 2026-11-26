@@ -7,6 +7,7 @@
 import { ActivityRenderer } from './renderers/activity.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { RENDERERS }        from './renderers/registry.js';
+import { DepthPreview, pairedColorTopic } from './renderers/depth-preview.js';
 import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
@@ -26,6 +27,28 @@ const MAX_COLS = 10;    // above the last band
 const EDGE = 48;        // px from a grid edge where a drag starts auto-scrolling
 const EDGE_SPEED = 14;  // px per frame of auto-scroll
 let _topicMcpMap = {};  // topic → mcpId, populated on fetch
+
+
+let _cameraCards = [];
+async function _resolveDepthPair(topic) {
+  const cards = _cameraCards.filter(({ ports }) => ports.some(port =>
+    port.topic === topic || (port.format === 'image/jpeg' && _cards.has(port.topic))));
+  const infos = await Promise.all(cards.map(async ({ card }) => {
+    try {
+      const response = await fetch(`/api/mcp/${encodeURIComponent(card.mcpId)}/call`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tool: card.toolName, arguments: { action: 'info', instance_id: card.id } }),
+      });
+      let { data } = await response.json();
+      if (Array.isArray(data) && data[0]?.text) data = JSON.parse(data[0].text);
+      return Array.isArray(data?.camera_info) ? data.camera_info.filter(info => _cards.has(info?.topic)) : [];
+    } catch {
+      return [];
+    }
+  }));
+  return pairedColorTopic(topic, infos.flat());
+}
 
 let _grid = null;
 let _cards = new Map(); // topicPath → { el, renderer, ws, format, mode, col, row, colSpan, rowSpan }
@@ -186,6 +209,12 @@ async function _fetchAndBuild() {
   // just as stale as the card topic it was copied from — sync it before use.
   syncConnectionTopics(canvasCards, connections);
 
+  _cameraCards = canvasCards.flatMap(card => {
+    const tool = mcps.find(mcp => mcp.id === card.mcpId)?.tools?.find(item => item?.name === card.toolName);
+    if (tool?.type !== 'sensor') return [];
+    const ports = [...(tool.topic_out || []), ...(card.topicOut || [])];
+    return ports.some(port => ['image/jpeg', 'image/depth-zlib'].includes(port.format)) ? [{ card, ports }] : [];
+  });
   const topicSet = new Set();
   _topicMcpMap = {};  // reset
   // First pass: collect all topic_out from static tool definitions (non-multiInstance)
@@ -345,7 +374,9 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
   `;
 
   const body = el.querySelector('.monitor-card-body');
-  const renderer = _createRenderer(format, defaultMode);
+  const renderer = format === 'image/depth-zlib'
+    ? new DepthPreview(topicPath, _resolveDepthPair, rgb => _setDepthPreviewSource(topicPath, rgb))
+    : _createRenderer(format, defaultMode);
   renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard', topicPath);
 
   const ws = _connectWs(topicPath, format, renderer);
@@ -377,7 +408,19 @@ function _applyPlacement(el, col, row, colSpan, rowSpan) {
   el.style.gridRow = `${row + 1} / span ${rowSpan}`;
 }
 
-function _connectWs(topicPath, format, renderer) {
+function _setDepthPreviewSource(topic, rgb) {
+  const card = _cards.get(topic);
+  if (!card || (card.rgb || '') === rgb) return;
+  card.rgb = rgb;
+  const old = card.ws;
+  card.ws = _connectWs(topic, card.format, card.renderer, rgb);
+  if (old) {
+    old.onmessage = null;
+    old.close();
+  }
+}
+
+function _connectWs(topicPath, format, renderer, rgb = '') {
   // An unresolved topic used to build `/ws/bus` with nothing after it. That
   // matches no route (the endpoint is `/ws/bus/{topic:path}`), so Starlette
   // failed the handshake and uvicorn logged `ASGI callable returned without
@@ -388,7 +431,8 @@ function _connectWs(topicPath, format, renderer) {
     return null;
   }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const wsUrl = `${proto}://${location.host}/ws/bus${topicPath}`;
+  const query = rgb ? `?rgb=${encodeURIComponent(rgb)}` : '';
+  const wsUrl = `${proto}://${location.host}/ws/bus${topicPath}${query}`;
 
   function create() {
     const ws = new WebSocket(wsUrl);
@@ -429,6 +473,7 @@ function _handleWsMessage(ev, renderer, format) {
   }
   try {
     const parsed = JSON.parse(ev.data);
+    if (parsed.type === 'meta') renderer.onStreamMeta?.(parsed);
     if (parsed.type === 'ping' || parsed.type === 'meta' || parsed.type === 'error') return false;
   } catch { /* not JSON — treat as payload */ }
   renderer.onData?.(new TextEncoder().encode(ev.data).buffer, format);
@@ -516,6 +561,7 @@ const HOLD_SLOP = 8;
 
 /** Controls inside a card that must keep their own click behaviour. */
 function _isInteractive(target) {
+  if (target.closest('.depth-preview-tools')) return true;
   return !!target.closest('.monitor-card-modes, .monitor-card-resize, button, a, input, select, textarea');
 }
 

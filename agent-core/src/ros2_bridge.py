@@ -122,8 +122,8 @@ def stop() -> None:
     print('[ros2_bridge] stopped')
 
 
-def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop, cb) -> None:
-    """订阅 topic；每收到一帧就在 loop 中 schedule cb(data: bytes, fmt: str)。"""
+def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop, cb, *, with_stamp=False) -> None:
+    """Forward bytes and format, with the ROS capture time in seconds when requested."""
     if not _HAS_RCLPY or not _running:
         return
 
@@ -149,7 +149,11 @@ def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop
             print(f'[ros2_bridge] decode error: {repr(e)}', file=sys.stderr)
             return
         _last_seen[topic] = _time.time()
-        asyncio.run_coroutine_threadsafe(cb(data, msg_fmt), _cb_loop)
+        args = (data, msg_fmt)
+        if with_stamp:
+            stamp = getattr(getattr(msg, 'header', None), 'stamp', None)
+            args += (stamp.sec + stamp.nanosec / 1e9 if stamp is not None else 0.0,)
+        asyncio.run_coroutine_threadsafe(cb(*args), _cb_loop)
 
     sub = _node_main.create_subscription(msg_type, topic, _on_msg, _low_lat_qos())
     with _lock:
